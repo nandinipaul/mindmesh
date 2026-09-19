@@ -36,6 +36,23 @@ def init_db():
                 status TEXT DEFAULT 'completed'
             )
         """)
+        #new
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS agent_outputs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL,
+            agent_name TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            status TEXT DEFAULT 'approved',
+            user_feedback TEXT,
+            evaluator_feedback TEXT,
+            created_at TEXT NOT NULL,
+            is_current INTEGER DEFAULT 1
+            )
+        """)
+
+
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_run_id ON blueprints(run_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_created_at ON blueprints(created_at DESC)")
         conn.commit()
@@ -143,6 +160,120 @@ def save_blueprint_record(
         ))
         conn.commit()
     return True
+
+#new
+def save_agent_output(
+    run_id: str,
+    agent_name: str,
+    content: str,
+    status: str = "approved",
+    user_feedback: str = "",
+    evaluator_feedback: str = "",
+    ) -> bool:
+    """Save an agent output and automatically assign its version."""
+
+    init_db()
+
+    created_at = time.strftime("%Y-%m-%d %H:%M:%S")
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+
+        # Find the latest version for this agent
+        cursor.execute("""
+            SELECT MAX(version)
+            FROM agent_outputs
+            WHERE run_id = ? AND agent_name = ?
+        """, (run_id, agent_name))
+
+        row = cursor.fetchone()
+
+        latest_version = row[0] or 0
+        new_version = latest_version + 1
+
+        # Mark previous version as no longer current
+        cursor.execute("""
+            UPDATE agent_outputs
+            SET is_current = 0
+            WHERE run_id = ? AND agent_name = ?
+        """, (run_id, agent_name))
+
+        # Save the new version
+        cursor.execute("""
+            INSERT INTO agent_outputs (
+                run_id,
+                agent_name,
+                version,
+                content,
+                status,
+                user_feedback,
+                evaluator_feedback,
+                created_at,
+                is_current
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+        """, (
+            run_id,
+            agent_name,
+            new_version,
+            content,
+            status,
+            user_feedback,
+            evaluator_feedback,
+            created_at
+        ))
+
+        conn.commit()
+
+    return True
+
+
+#new
+def get_current_agent_outputs(run_id: str) -> List[Dict[str, Any]]:
+    """Get the latest/current output for every agent in a blueprint run."""
+    init_db()
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT *
+            FROM agent_outputs
+            WHERE run_id = ? AND is_current = 1
+            ORDER BY id ASC
+        """, (run_id,))
+
+        rows = cursor.fetchall()
+        return [dict(row) for row in rows]
+
+
+def get_agent_output(
+    run_id: str,
+    agent_name: str
+    ) -> Optional[Dict[str, Any]]:
+    """Get the current output of a specific agent."""
+    init_db()
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT *
+            FROM agent_outputs
+            WHERE run_id = ?
+              AND agent_name = ?
+              AND is_current = 1
+            ORDER BY version DESC
+            LIMIT 1
+        """, (run_id, agent_name))
+
+        row = cursor.fetchone()
+        
+        if row:
+            return dict(row)
+
+    return None
+    
 
 
 def get_blueprint_history(limit: int = 50) -> List[Dict[str, Any]]:

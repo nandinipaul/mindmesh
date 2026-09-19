@@ -15,6 +15,15 @@ from src.agents.report_writer.task import create_report_writer_task
 from src.agents.evaluator.task import create_evaluator_task
 from src.utils.html_converter import markdown_to_html
 
+from src.db import save_agent_output
+
+AGENT_ORDER = [
+    "business_analyst",
+    "solution_architect",
+    "technology_advisor",
+    "devops_architect",
+    "delivery_planner",
+]
 
 def parse_evaluation_json(eval_raw: str) -> Dict[str, Any]:
     """Parse JSON evaluation output from the evaluator agent."""
@@ -371,6 +380,12 @@ async def run_agents_step_by_step(
             "progress": complete_pct,
         })
 
+        save_agent_output(
+            run_id=run_id,
+            agent_name=agent_name.lower().replace(" ", "_"),
+            content=final_output,
+        )
+
         return final_output
 
     # Queue to yield from helper
@@ -621,3 +636,23 @@ async def run_agents_step_by_step(
         yield event
 
     await pipeline_task
+
+
+#new
+async def regenerate_agent(
+    agent_name: str,
+    previous_output: str,
+    upstream_outputs: dict,
+    user_feedback: str,
+):
+    """
+    Regeneration interface.
+
+    Team members will implement the actual agent-specific
+    Researcher -> Writer -> Evaluator workflow here.
+    """
+
+    raise NotImplementedError(
+        f"Regeneration logic for '{agent_name}' "
+        "has not been implemented yet."
+    )

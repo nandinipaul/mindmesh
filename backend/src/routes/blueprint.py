@@ -7,15 +7,19 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from src.crew import create_crew, run_agents_step_by_step, build_master_blueprint
+from src.crew import create_crew, run_agents_step_by_step, build_master_blueprint, AGENT_ORDER, regenerate_agent
 from src.utils.output_file import save_output
 from src.utils.html_converter import markdown_to_html
 from src.db import (
     save_blueprint_record,
     get_blueprint_history,
     get_blueprint_by_run_id,
-    delete_blueprint_by_run_id
+    delete_blueprint_by_run_id,
+    get_current_agent_outputs,
+    get_agent_output,
+    save_agent_output,
 )
+
 
 router = APIRouter(prefix="/blueprints", tags=["Blueprints"])
 
@@ -27,6 +31,10 @@ class BlueprintRequest(BaseModel):
     expected_daily_traffic: str 
     delivery_timeline_months: int
     data_hosting_country: str 
+
+class RegenerateRequest(BaseModel):
+    agent: str
+    feedback: str
 
 
 @router.get("", status_code=200)
@@ -122,7 +130,7 @@ async def create_blueprint(payload: BlueprintRequest):
     try:
         crew = create_crew(**payload_dict)
         result = await crew.kickoff_async()
-        
+        #if hasattr(result, "tasks_output") and len(result.tasks_output) >= 6:   recommended change
         if hasattr(result, "tasks_output") and len(result.tasks_output) >= 5:
             ba_out = result.tasks_output[0].raw
             sa_out = result.tasks_output[1].raw
@@ -213,6 +221,254 @@ async def get_blueprint(run_id: str):
         "html": html_content
     }
 
+#new
+@router.post("/{run_id}/regenerate")
+async def regenerate_blueprint_agent(
+    run_id: str,
+    payload: RegenerateRequest
+):
+    """
+    Regenerate the selected agent and cascade regeneration
+    through all downstream specialist agents.
+
+    Agents before the selected agent remain unchanged.
+    """
+
+    # ---------------------------------------------------------
+    # 1. Validate agent
+    # ---------------------------------------------------------
+    if payload.agent not in AGENT_ORDER:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid agent: {payload.agent}"
+        )
+
+    # ---------------------------------------------------------
+    # 2. Check blueprint exists
+    # ---------------------------------------------------------
+    blueprint = get_blueprint_by_run_id(run_id)
+
+    if not blueprint:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Blueprint '{run_id}' not found."
+        )
+
+    # ---------------------------------------------------------
+    # 3. Get current output of selected agent
+    # ---------------------------------------------------------
+    selected_output = get_agent_output(
+        run_id,
+        payload.agent
+    )
+
+    if not selected_output:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No current output found for agent '{payload.agent}'."
+        )
+
+    # ---------------------------------------------------------
+    # 4. Determine cascade range
+    # ---------------------------------------------------------
+    selected_index = AGENT_ORDER.index(payload.agent)
+
+    agents_to_regenerate = AGENT_ORDER[selected_index:]
+
+    regenerated_outputs = {}
+
+    # ---------------------------------------------------------
+    # 5. Regenerate selected agent + downstream agents
+    # ---------------------------------------------------------
+    for index, agent_name in enumerate(agents_to_regenerate):
+
+        current_output = get_agent_output(
+            run_id,
+            agent_name
+        )
+
+        if not current_output:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No current output found for agent '{agent_name}'."
+            )
+
+        # Gather CURRENT outputs from all upstream agents
+        upstream_outputs = {}
+
+        agent_position = AGENT_ORDER.index(agent_name)
+
+        for upstream_agent in AGENT_ORDER[:agent_position]:
+
+            upstream_output = get_agent_output(
+                run_id,
+                upstream_agent
+            )
+
+            if upstream_output:
+                upstream_outputs[upstream_agent] = (
+                    upstream_output["content"]
+                )
+
+        # For the first agent, use the user's feedback.
+        # For downstream agents, cascade automatically.
+        feedback = payload.feedback if index == 0 else (
+            f"This agent is being regenerated because "
+            f"the upstream agent '{AGENT_ORDER[agent_position - 1]}' "
+            f"was regenerated. Reconcile your output with the "
+            f"latest upstream outputs."
+        )
+
+        regenerated_output = await regenerate_agent(
+            agent_name=agent_name,
+            previous_output=current_output["content"],
+            upstream_outputs=upstream_outputs,
+            user_feedback=feedback,
+        )
+
+        # Save as a NEW version.
+        # save_agent_output automatically:
+        # - increments version
+        # - marks old version non-current
+        # - marks new version current
+        save_agent_output(
+            run_id=run_id,
+            agent_name=agent_name,
+            content=regenerated_output,
+            user_feedback=feedback,
+        )
+
+        regenerated_outputs[agent_name] = regenerated_output
+
+    # ---------------------------------------------------------
+    # 6. Load CURRENT outputs after entire cascade
+    # ---------------------------------------------------------
+    current_outputs = {}
+
+    for agent_name in AGENT_ORDER:
+
+        output = get_agent_output(
+            run_id,
+            agent_name
+        )
+
+        if output:
+            current_outputs[agent_name] = output["content"]
+
+    # ---------------------------------------------------------
+    # 7. Rebuild Master Blueprint
+    # ---------------------------------------------------------
+    master_md = build_master_blueprint(
+        inputs={
+            "business_idea": blueprint.get("business_idea", ""),
+            "technology_preference": blueprint.get(
+                "technology_preference", ""
+            ),
+            "cloud_preference": blueprint.get(
+                "cloud_preference", ""
+            ),
+            "expected_daily_traffic": blueprint.get(
+                "expected_daily_traffic", ""
+            ),
+            "delivery_timeline_months": blueprint.get(
+                "delivery_timeline_months", 6
+            ),
+            "data_hosting_country": blueprint.get(
+                "data_hosting_country", ""
+            ),
+        },
+        ba_output=current_outputs.get(
+            "business_analyst", ""
+        ),
+        sa_output=current_outputs.get(
+            "solution_architect", ""
+        ),
+        ta_output=current_outputs.get(
+            "technology_advisor", ""
+        ),
+        do_output=current_outputs.get(
+            "devops_architect", ""
+        ),
+        dp_output=current_outputs.get(
+            "delivery_planner", ""
+        ),
+        rw_output="",
+        run_id=run_id,
+    )
+
+    # ---------------------------------------------------------
+    # 8. Convert master blueprint to HTML
+    # ---------------------------------------------------------
+    html_content = markdown_to_html(
+        master_md,
+        title=f"MindMesh Blueprint - {run_id}"
+    )
+
+    # ---------------------------------------------------------
+    # 9. Update saved blueprint
+    # ---------------------------------------------------------
+    save_blueprint_record(
+        run_id=run_id,
+        inputs={
+            "business_idea": blueprint.get(
+                "business_idea", ""
+            ),
+            "technology_preference": blueprint.get(
+                "technology_preference", ""
+            ),
+            "cloud_preference": blueprint.get(
+                "cloud_preference", ""
+            ),
+            "expected_daily_traffic": blueprint.get(
+                "expected_daily_traffic", ""
+            ),
+            "delivery_timeline_months": blueprint.get(
+                "delivery_timeline_months", 6
+            ),
+            "data_hosting_country": blueprint.get(
+                "data_hosting_country", ""
+            ),
+        },
+        markdown_content=master_md,
+        html_content=html_content,
+        status="completed",
+    )
+
+    # ---------------------------------------------------------
+    # 10. Update filesystem outputs
+    # ---------------------------------------------------------
+    save_output(
+        f"{run_id}.html",
+        html_content
+    )
+
+    save_output(
+        f"{run_id}.md",
+        master_md
+    )
+
+    save_output(
+        "final_output.html",
+        html_content
+    )
+
+    save_output(
+        "final_output.md",
+        master_md
+    )
+
+    # ---------------------------------------------------------
+    # 11. Return complete cascade result
+    # ---------------------------------------------------------
+    return {
+        "run_id": run_id,
+        "status": "regenerated",
+        "regenerated_agent": payload.agent,
+        "cascade": agents_to_regenerate,
+        "outputs": regenerated_outputs,
+        "master_blueprint": master_md,
+        "html": html_content,
+    }
 
 @router.delete("/{run_id}", status_code=200)
 async def delete_blueprint(run_id: str):
